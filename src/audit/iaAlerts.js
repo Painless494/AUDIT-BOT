@@ -14,14 +14,17 @@
 //     while they're being handled by IA.
 
 const { EmbedBuilder } = require("discord.js");
-const { isPassingGrade } = require("./grading");
+const { repairDailyAuditRecords } = require("./dailyAudit");
 const { saveSettings } = require("../db");
 const { queryPNW } = require("../pnw");
 
-function isFailing(record, settings) {
-  // Uses the same grade system the rest of the bot uses — "Failing" is
-  // whatever grade falls below the configured average threshold.
-  return !isPassingGrade(record.grade);
+// A failing audit is one graded "Failing" (the lowest grade). Records from before
+// grades existed only have a pass/fail value, so that is used for those.
+function isFailing(record) {
+  if (typeof record.grade === "string" && record.grade.trim()) {
+    return record.grade.trim().toLowerCase() === "failing";
+  }
+  return record.pass === false;
 }
 
 function getWindowStart(windowDays) {
@@ -106,7 +109,7 @@ async function fetchAllianceActivity(allianceId) {
   return members.filter((n) => (n.alliance_position || "").toUpperCase() !== "APPLICANT");
 }
 
-async function runInactivityRecommendations(channel, settings, stats) {
+async function runInactivityRecommendations(channel, settings, stats, ignoreCooldown = false) {
   const config = settings.iaAlerts;
   const days = config.inactivityDays ?? 8;
   const now = Date.now();
@@ -118,17 +121,24 @@ async function runInactivityRecommendations(channel, settings, stats) {
 
   const flagged = [];
   for (const nation of members) {
-    if (Number(nation.vacation_mode_turns) > 0) continue;
     const lastActive = new Date(nation.last_active).getTime();
-    if (!nation.last_active || Number.isNaN(lastActive)) continue;
+    if (!nation.last_active || Number.isNaN(lastActive)) {
+      stats.inactiveNoData += 1;
+      continue;
+    }
     const inactiveDays = (now - lastActive) / DAY_MS;
     if (inactiveDays <= days) continue;
+    stats.inactiveOverLimit += 1;
+    if (Number(nation.vacation_mode_turns) > 0) {
+      stats.inactiveVmSkipped += 1; // away on purpose
+      continue;
+    }
 
     // A separate key from the audit-failure alerts, so one doesn't hide the other.
     const key = `${nation.id}:inactive`;
     const alertedAt = config.lastAlertedNations[key];
-    if (alertedAt && now - new Date(alertedAt).getTime() < cooldownMs) {
-      stats.skippedCooldown += 1;
+    if (!ignoreCooldown && alertedAt && now - new Date(alertedAt).getTime() < cooldownMs) {
+      stats.inactiveOnCooldown += 1;
       continue;
     }
     flagged.push({ nation, inactiveDays, lastActive, key });
@@ -187,76 +197,111 @@ async function runInactivityRecommendations(channel, settings, stats) {
   }
 }
 
-async function runIaAlertsForGuild(client, guild, settings, guildId) {
+async function runIaAlertsForGuild(client, guild, settings, guildId, { ignoreCooldown = false } = {}) {
   const config = settings.iaAlerts;
-  const stats = { checked: 0, recommended: 0, skippedCooldown: 0, skippedData: 0, inactiveChecked: 0, inactiveRecommended: 0, errors: 0 };
+  const stats = {
+    checked: 0,
+    recommended: 0,
+    skippedCooldown: 0,
+    skippedData: 0,
+    inactiveChecked: 0,
+    inactiveOverLimit: 0,
+    inactiveVmSkipped: 0,
+    inactiveOnCooldown: 0,
+    inactiveNoData: 0,
+    inactiveRecommended: 0,
+    repaired: 0,
+    errors: 0,
+    problem: null
+  };
 
-  if (!config.iaChannelId || !config.iaRoleId) return stats;
+  if (!config.iaChannelId || !config.iaRoleId) {
+    stats.problem = "The IA role or channel isn't set - use /set_ia_config.";
+    return stats;
+  }
 
   const channel = guild.channels.cache.get(config.iaChannelId);
-  if (!channel) return stats;
-
-  // Get unique nation IDs from history within the window
-  const windowStart = getWindowStart(config.windowDays);
-  const recentHistory = (settings.auditHistory || []).filter(
-    (r) => new Date(r.date) >= windowStart
-  );
-
-  const nationMap = new Map();
-  for (const record of recentHistory) {
-    if (!nationMap.has(String(record.nationId))) {
-      nationMap.set(String(record.nationId), record.nationName);
-    }
+  if (!channel) {
+    stats.problem = "The IA channel can't be found - it may have been deleted, or the bot can't see it.";
+    return stats;
   }
 
-  stats.checked = nationMap.size;
-
-  for (const [nationId, nationName] of nationMap.entries()) {
-    if (isOnCooldown(settings, nationId)) {
-      stats.skippedCooldown += 1;
-      continue;
-    }
-
-    const analysis = analyseNation(nationId, nationName, settings.auditHistory || [], settings);
-
-    if (!analysis.recommend) {
-      if (analysis.reason === "insufficient_data") stats.skippedData += 1;
-      continue;
-    }
-
-    // Fire the alert
-    const embed = new EmbedBuilder()
-      .setTitle(`🚨 IA Removal Recommendation — ${nationName}`)
-      .setColor(0xe74c3c)
-      .setDescription(
-        `**Nation:** ${nationName} (ID: ${nationId})\n` +
-          `**Failure rate:** ${analysis.failureRate}% (${analysis.failingCount}/${analysis.auditCount} audits failing)\n` +
-          `**Window:** Last ${analysis.windowDays} days\n` +
-          `**Average score:** ${analysis.avgScore}% | **Lowest:** ${analysis.lowestScore}%\n\n` +
-          `**Recent trend (oldest → newest):**\n${analysis.recent10}\n\n` +
-          `This nation has been consistently failing audit standards. IA review is recommended.\n` +
-          `View full history with \`/audit_history nation:${nationId}\``
-      )
-      .setFooter({
-        text: `Threshold: ${config.failureRateThreshold}% failure rate over ${config.windowDays} days (min ${config.minAudits} audits required)`
-      });
-
-    try {
-      await channel.send({ content: `<@&${config.iaRoleId}>`, embeds: [embed] });
-      stats.recommended += 1;
-
-      // Mark this nation as alerted so we don't ping again during the cooldown
-      if (!settings.iaAlerts.lastAlertedNations) settings.iaAlerts.lastAlertedNations = {};
-      settings.iaAlerts.lastAlertedNations[String(nationId)] = new Date().toISOString();
-    } catch (error) {
-      console.error(`[iaAlerts] Failed to post alert for nation ${nationId}:`, error.message);
-    }
+  // Daily-audit records saved by an earlier version have no grade; fix them from their saved score.
+  try {
+    stats.repaired = repairDailyAuditRecords(settings);
+  } catch (error) {
+    console.error("[iaAlerts] Couldn't repair old audit records:", error.message);
   }
 
-  // Inactivity trigger (on by default). A failure here must not undo the audit part above.
+  // ---- Trigger 1: nations failing audits for too long ----
+  // Kept separate so that a problem here can never stop the inactivity trigger below.
+  try {
+    const windowStart = getWindowStart(config.windowDays);
+    const recentHistory = (settings.auditHistory || []).filter((r) => r && new Date(r.date) >= windowStart);
+
+    const nationMap = new Map();
+    for (const record of recentHistory) {
+      if (!nationMap.has(String(record.nationId))) {
+        nationMap.set(String(record.nationId), record.nationName);
+      }
+    }
+
+    stats.checked = nationMap.size;
+
+    for (const [nationId, nationName] of nationMap.entries()) {
+      if (!ignoreCooldown && isOnCooldown(settings, nationId)) {
+        stats.skippedCooldown += 1;
+        continue;
+      }
+
+      const analysis = analyseNation(nationId, nationName, (settings.auditHistory || []).filter(Boolean), settings);
+
+      if (!analysis.recommend) {
+        if (analysis.reason === "insufficient_data") stats.skippedData += 1;
+        continue;
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🚨 IA Removal Recommendation — ${nationName}`)
+        .setColor(0xe74c3c)
+        .setDescription(
+          `**Nation:** ${nationName} (ID: ${nationId})\n` +
+            `**Failure rate:** ${analysis.failureRate}% (${analysis.failingCount}/${analysis.auditCount} audits failing)\n` +
+            `**Window:** Last ${analysis.windowDays} days\n` +
+            `**Average score:** ${analysis.avgScore}% | **Lowest:** ${analysis.lowestScore}%\n\n` +
+            `**Recent trend (oldest → newest):**\n${analysis.recent10}\n\n` +
+            `This nation has been consistently failing audit standards. IA review is recommended.\n` +
+            `View full history with \`/audit_history nation:${nationId}\``
+        )
+        .setFooter({
+          text: `Threshold: ${config.failureRateThreshold}% failure rate over ${config.windowDays} days (min ${config.minAudits} audits required)`
+        });
+
+      try {
+        await channel.send({
+          content: `<@&${config.iaRoleId}>`,
+          embeds: [embed],
+          allowedMentions: { roles: [config.iaRoleId] }
+        });
+        stats.recommended += 1;
+
+        // Mark this nation as alerted so we don't ping again during the cooldown
+        if (!settings.iaAlerts.lastAlertedNations) settings.iaAlerts.lastAlertedNations = {};
+        settings.iaAlerts.lastAlertedNations[String(nationId)] = new Date().toISOString();
+      } catch (error) {
+        stats.errors += 1;
+        console.error(`[iaAlerts] Failed to post alert for nation ${nationId}:`, error.message);
+      }
+    }
+  } catch (error) {
+    stats.errors += 1;
+    console.error("[iaAlerts] Audit-failure analysis failed:", error);
+  }
+
+  // ---- Trigger 2: nations inactive for too long (on by default) ----
   if (config.inactivityEnabled !== false && settings.alliance?.id) {
     try {
-      await runInactivityRecommendations(channel, settings, stats);
+      await runInactivityRecommendations(channel, settings, stats, ignoreCooldown);
     } catch (error) {
       stats.errors += 1;
       console.error("[iaAlerts] Inactivity check failed:", error.message);
