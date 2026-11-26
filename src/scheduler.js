@@ -11,6 +11,8 @@ const { runIaAlertsForGuild } = require("./audit/iaAlerts");
 const { runCooldownAlertsForGuild } = require("./audit/cooldownAlerts");
 const { runVmGuardForGuild } = require("./audit/vmGuard");
 const { loadVmGuard } = require("./audit/vmGuardStore");
+const { runCheckDmsForGuild } = require("./audit/checkDms");
+const { loadCheckDms, enabledKeys } = require("./audit/checkDmStore");
 
 const TICK_INTERVAL_MS = 15 * 60 * 1000;
 const STARTUP_GRACE_MS = 5 * 60 * 1000;
@@ -150,6 +152,18 @@ async function tick(client) {
       }
     } catch (error) {
       console.error("[vmGuard] Couldn't start the check:", error.message);
+    }
+
+    // Per-rule DM reminders - runs every few hours (set with /check_dms settings).
+    // Like the VM guard, it keeps its data in its own file.
+    try {
+      const dm = loadCheckDms(guild.id);
+      if (dm.enabled && settings.alliance.id && enabledKeys(dm).length > 0 &&
+          isDue(dm.lastRunAt, dm.intervalHours * 60 * 60 * 1000)) {
+        await runJob(`${guild.id}:checkDms`, "checkDms", () => runCheckDmsForGuild(client, guild, settings));
+      }
+    } catch (error) {
+      console.error("[checkDms] Couldn't start the run:", error.message);
     }
   }
 }
