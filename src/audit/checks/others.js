@@ -82,6 +82,8 @@ const checks = [
 
       const excessViolations = [];   // holding MORE than target → deposit in bank
       const lowViolations = [];      // holding LESS than target÷underDivisor → dangerously low
+      const excessData = [];         // the same findings as numbers (used by the DM reminders)
+      const lowData = [];
 
       for (const resource of RESOURCE_FIELDS) {
         if (isHidden(nation[resource])) continue;
@@ -97,10 +99,12 @@ const checks = [
           excessViolations.push(
             `${resource}: ${actual.toLocaleString()} > max ${target.toLocaleString()} — deposit excess in alliance bank`
           );
+          excessData.push({ resource, actual, max: target });
         } else if (actual < floor) {
           lowViolations.push(
             `${resource}: ${actual.toLocaleString()} < min ${Math.floor(floor).toLocaleString()} (target ${target.toLocaleString()} ÷ ${underDivisor})`
           );
+          lowData.push({ resource, actual, min: Math.floor(floor), target });
         }
       }
 
@@ -109,7 +113,8 @@ const checks = [
         passed: allViolations.length === 0,
         detail: allViolations.length === 0
           ? "All tracked resources within warchest policy."
-          : allViolations.join("; ")
+          : allViolations.join("; "),
+        data: { excess: excessData, low: lowData }
       };
     }
   },
